@@ -1,7 +1,8 @@
 {
   "token": "",
   "admin_server_id": ,
-  "verification_channel_id":
+  "verification_channel_id": ,
+  "report_channel_id": ,
 }
 
 
