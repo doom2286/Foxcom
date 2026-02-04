@@ -31,6 +31,7 @@ async def setup_hook():
         "cogs.feedback",
         "cogs.admin",
         "cogs.groups",
+	"cogs.help",
     ]
 
     loaded = []
