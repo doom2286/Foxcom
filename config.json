@@ -1,8 +1,9 @@
 {
-  "token": "",
-  "admin_server_id": ,
-  "verification_channel_id": ,
-  "report_channel_id": ,
+    "token": "",
+    "admin_server_id": ,
+    "verification_channel_id": ,
+    "report_channel_id": ,
+    "google_translate_api_key": ""
 }
 
 
