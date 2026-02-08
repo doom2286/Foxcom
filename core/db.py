@@ -122,6 +122,12 @@ def _migrate(cur: sqlite3.Cursor):
         if "delta" in cols:
             _safe_exec(cur, "UPDATE rep_votes SET vote = delta WHERE (vote IS NULL OR vote = 0) AND delta IS NOT NULL")
 
+
+    # groups
+    if _table_exists(cur, "groups"):
+        _ensure_column(cur, "groups", "global_translate_enabled", "global_translate_enabled INTEGER NOT NULL DEFAULT 1")
+        _safe_exec(cur, "UPDATE groups SET global_translate_enabled = 1 WHERE global_translate_enabled IS NULL")
+
     # maintenance
     if _table_exists(cur, "maintenance"):
         _ensure_column(cur, "maintenance", "last_prune_at", "last_prune_at TEXT")
@@ -218,12 +224,28 @@ def init():
         cur.execute("INSERT OR IGNORE INTO maintenance (id, last_prune_at) VALUES (1, NULL)")
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            user_name TEXT NOT NULL,
+            group_translate_enabled INTEGER NOT NULL DEFAULT 1
+        )
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS groups (
             group_id        INTEGER PRIMARY KEY AUTOINCREMENT,
             name            TEXT NOT NULL UNIQUE COLLATE NOCASE,
             visibility      TEXT NOT NULL CHECK (visibility IN ('public','private')),
             password_salt   BLOB,
             password_hash   BLOB,
+            global_translate_enabled INTEGER NOT NULL DEFAULT 1,
             owner_user_id   INTEGER NOT NULL,
             created_at      TEXT NOT NULL
         )
@@ -365,6 +387,140 @@ def get_last_prune():
     r = cur.fetchone()
     conn.close()
     return r["last_prune_at"] if r else None
+
+
+
+# -----------------------
+# Global bot settings (key/value)
+# -----------------------
+def get_bot_setting(key: str, default: str | None = None) -> str | None:
+    conn = connect(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT value FROM bot_settings WHERE key=?", (str(key),))
+        r = cur.fetchone()
+        return str(r["value"]) if r else default
+    except Exception:
+        return default
+    finally:
+        conn.close()
+
+
+def set_bot_setting(key: str, value: str) -> None:
+    with _DB_WRITE_LOCK:
+        conn = connect(); cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO bot_settings(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(key), str(value)),
+        )
+        conn.commit(); conn.close()
+
+
+def get_global_translation_enabled(default: bool = True) -> bool:
+    v = get_bot_setting("global_translation_enabled", "1" if default else "0")
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on", "enabled")
+
+
+def toggle_global_translation_enabled(default: bool = True) -> bool:
+    cur = get_global_translation_enabled(default=default)
+    new_val = "0" if cur else "1"
+    set_bot_setting("global_translation_enabled", new_val)
+    return new_val == "1"
+
+
+# -----------------------
+# User settings (per-user defaults)
+# -----------------------
+def upsert_user_settings(user_id: int, user_name: str) -> None:
+    """Ensure the user_settings row exists and keep user_name fresh."""
+    with _DB_WRITE_LOCK:
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO user_settings(user_id, user_name, group_translate_enabled) "
+            "VALUES(?, ?, 1) "
+            "ON CONFLICT(user_id) DO UPDATE SET user_name=excluded.user_name",
+            (int(user_id), str(user_name)),
+        )
+        conn.commit()
+        conn.close()
+
+
+def get_user_group_translate_enabled(user_id: int, default: bool = True) -> bool:
+    """Global default for whether this user's GROUP messages should be translated."""
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT group_translate_enabled FROM user_settings WHERE user_id=?", (int(user_id),))
+        r = cur.fetchone()
+        if not r:
+            return bool(default)
+        return int(r["group_translate_enabled"]) == 1
+    except Exception:
+        return bool(default)
+    finally:
+        conn.close()
+
+
+def set_user_group_translate_enabled(user_id: int, user_name: str, enabled: bool) -> None:
+    with _DB_WRITE_LOCK:
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO user_settings(user_id, user_name, group_translate_enabled) "
+            "VALUES(?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "user_name=excluded.user_name, "
+            "group_translate_enabled=excluded.group_translate_enabled",
+            (int(user_id), str(user_name), 1 if enabled else 0),
+        )
+        conn.commit()
+        conn.close()
+
+
+def toggle_user_group_translate_enabled(user_id: int, user_name: str, default: bool = True) -> bool:
+    cur_state = get_user_group_translate_enabled(user_id, default=default)
+    new_state = not cur_state
+    set_user_group_translate_enabled(user_id, user_name, new_state)
+    return new_state
+
+
+# -----------------------
+# Group settings (stored on groups table)
+# -----------------------
+def get_group_global_translate_enabled(group_id: int, default: bool = True) -> bool:
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT global_translate_enabled FROM groups WHERE group_id=?", (int(group_id),))
+        r = cur.fetchone()
+        if not r or r["global_translate_enabled"] is None:
+            return bool(default)
+        return int(r["global_translate_enabled"]) == 1
+    except Exception:
+        return bool(default)
+    finally:
+        conn.close()
+
+
+def set_group_global_translate_enabled(group_id: int, enabled: bool) -> None:
+    with _DB_WRITE_LOCK:
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE groups SET global_translate_enabled=? WHERE group_id=?",
+            (1 if enabled else 0, int(group_id)),
+        )
+        conn.commit()
+        conn.close()
+
+
+def toggle_group_global_translate_enabled(group_id: int, default: bool = True) -> bool:
+    cur_state = get_group_global_translate_enabled(group_id, default=default)
+    new_state = not cur_state
+    set_group_global_translate_enabled(group_id, new_state)
+    return new_state
 
 
 # -----------------------

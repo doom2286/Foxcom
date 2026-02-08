@@ -1,4 +1,4 @@
-# cogs/broadcasts.py
+# cogs/broadcasts.py  (BroadcastsCog)
 import io
 import discord
 from discord.ext import commands
@@ -14,16 +14,34 @@ CFG = load_config()
 ADMIN_SERVER_ID = int(CFG.get("admin_server_id") or 0)
 
 # -----------------------------------------------------------------------------
+# Google Translate (v2 REST via API key) settings
+# -----------------------------------------------------------------------------
+def _cfg_bool(v, default: bool = False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on", "enabled")
+
+GOOGLE_TRANSLATE_KEY = (CFG.get("google_translate_api_key") or "").strip()
+TRANSLATE_ENABLED = _cfg_bool(CFG.get("translate_enabled"), default=True)
+TRANSLATE_SHOW_ORIGINAL = _cfg_bool(CFG.get("translate_show_original"), default=True)
+try:
+    TRANSLATE_MIN_CHARS = int(CFG.get("translate_min_chars") or 12)
+except Exception:
+    TRANSLATE_MIN_CHARS = 12
+
+# Try to import translation helper; fall back to no-op if missing
+try:
+    from core.translate import maybe_translate_to_english  # type: ignore
+except Exception:
+    async def maybe_translate_to_english(api_key: str, text: str, *, enabled: bool = True, min_chars: int = 12):
+        return text, None, False, None
+
+
+# -----------------------------------------------------------------------------
 # Rep cosmetics
-#
-# Tier mapping (matches your latest confirmed rules):
-#   0-9   : grey,   no stars
-#   10-24 : green,  ★
-#   25-49 : blue,   ★★
-#   50-99 : purple, ★★★
-#   100+  : gold,   🌟   (single emoji star)
-#
-# Note: Discord embeds don't have a true "border", just an accent color bar.
 # -----------------------------------------------------------------------------
 def _rep_badge(rep: int) -> str:
     if rep >= 100:
@@ -59,18 +77,15 @@ def _format_regiment_tag(regiment: str | None, fallback: str) -> str:
 
 
 def _limits_for_rep(rep: int) -> tuple[int, int]:
-    """
-    Return (max_actions, window_seconds) based on reputation.
-    """
     if rep <= -30:
-        return 1, 4 * 60 * 60     # 1 per 4 hours
+        return 1, 4 * 60 * 60
     if rep <= -2:
-        return 1, 60 * 60         # 1 per hour
+        return 1, 60 * 60
     if rep <= 9:
-        return 5, 60 * 60         # 5 per hour
+        return 5, 60 * 60
     if rep <= 25:
-        return 15, 60 * 60        # 15 per hour
-    return 30, 60 * 60            # 30 per hour
+        return 15, 60 * 60
+    return 30, 60 * 60
 
 
 def _format_wait(retry_after: int) -> str:
@@ -86,9 +101,6 @@ def _format_wait(retry_after: int) -> str:
 
 
 def _should_prune_rep(now_utc: datetime, min_interval_seconds: int = 10 * 60) -> bool:
-    """
-    Avoid pruning on every broadcast; it causes extra writes and lock contention.
-    """
     try:
         last = db.get_last_prune()
         if not last:
@@ -102,7 +114,6 @@ def _should_prune_rep(now_utc: datetime, min_interval_seconds: int = 10 * 60) ->
 
 
 async def _deny_if_blocked(interaction: discord.Interaction) -> bool:
-    # Allow admins in the admin server to bypass user blocks
     if interaction.guild and interaction.guild.id == ADMIN_SERVER_ID:
         perms = getattr(interaction.user, "guild_permissions", None)
         if perms and getattr(perms, "administrator", False):
@@ -120,6 +131,43 @@ async def _deny_if_blocked(interaction: discord.Interaction) -> bool:
         return True
 
     return False
+
+
+def _perm_report_for_channel(me: discord.Member | None, channel: discord.abc.GuildChannel | discord.Thread) -> str:
+    """
+    Returns a human-friendly permission report for the bot in the target channel.
+    Works for TextChannel and Thread (effective perms for thread are based on parent + thread state).
+    """
+    if me is None:
+        return "Bot member not available (cache)."
+
+    # Threads are a bit special; use parent channel permissions as a baseline,
+    # and also report thread state.
+    base_channel = channel.parent if isinstance(channel, discord.Thread) else channel
+    perms = base_channel.permissions_for(me)
+
+    need = {
+        "View Channel": perms.view_channel,
+        "Send Messages": perms.send_messages,
+        "Embed Links": perms.embed_links,
+        "Attach Files": perms.attach_files,
+        "Read Message History": perms.read_message_history,
+        "Send Messages in Threads": getattr(perms, "send_messages_in_threads", True),
+    }
+
+    lines = []
+    for k, v in need.items():
+        lines.append(f"{'✅' if v else '❌'} {k}")
+
+    extra = []
+    if isinstance(channel, discord.Thread):
+        extra.append(f"Thread archived: {channel.archived}")
+        extra.append(f"Thread locked: {channel.locked}")
+
+    report = " | ".join(lines)
+    if extra:
+        report += "\n" + " • " + "\n • ".join(extra)
+    return report
 
 
 class BroadcastsCog(commands.Cog):
@@ -166,7 +214,7 @@ class BroadcastsCog(commands.Cog):
             )
             return
 
-        # Optional: word filter (if your WordFilterCog exposes check_text)
+        # Optional: word filter (pre-translation pass)
         wf = self.bot.get_cog("WordFilterCog")
         if wf:
             try:
@@ -181,35 +229,72 @@ class BroadcastsCog(commands.Cog):
                         )
                         return
             except Exception:
-                pass  # Don't fail broadcasts if filter errors
+                pass
 
-        # Defer quickly so Discord doesn't show "did not respond"
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
+        # --- Optional auto-translation to English (Google Translate v2 via API key) ---
+        translated_msg = message
+        detected_lang = None
+        did_translate = False
+        original_msg = None
+
+        # Global toggle (bot-wide) + local config toggle must both be enabled
+        global_translate_enabled = True
+        try:
+            global_translate_enabled = db.get_global_translation_enabled(default=True)
+        except Exception:
+            global_translate_enabled = True
+
+        if TRANSLATE_ENABLED and global_translate_enabled and GOOGLE_TRANSLATE_KEY:
+            try:
+                translated_msg, detected_lang, did_translate, original_msg = await maybe_translate_to_english(
+                    GOOGLE_TRANSLATE_KEY,
+                    message,
+                    enabled=True,
+                    min_chars=TRANSLATE_MIN_CHARS
+                )
+            except Exception as e:
+                # Fail open: broadcast original if translate fails
+                print(f"[translate] failed: {e}")
+                translated_msg = message
+                detected_lang = None
+                did_translate = False
+                original_msg = None
+
+        # Optional: word filter (post-translation pass)
+        if did_translate and wf and hasattr(wf, "check_text"):
+            try:
+                hit2 = wf.check_text(translated_msg)
+                if hit2:
+                    await interaction.followup.send(
+                        "This broadcast was blocked after translation (banned word/phrase detected).",
+                        ephemeral=True
+                    )
+                    return
+            except Exception:
+                pass
+
         now = datetime.now(timezone.utc)
 
-        # Prune rep tracking occasionally (not every time)
         if _should_prune_rep(now):
             try:
                 db.prune_rep()
             except Exception as e:
                 print(f"[rep] prune_rep failed: {e}")
 
-        # Ensure rep record exists
         try:
             db.ensure_rep_user(interaction.user.id, str(interaction.user))
         except Exception as e:
             print(f"[rep] ensure_rep_user failed: {e}")
 
-        # Fetch rep
         sender_rep = 0
         try:
             sender_rep = int(db.get_rep(interaction.user.id) or 0)
         except Exception:
             sender_rep = 0
 
-        # Rep-based broadcast quota
         max_actions, window_seconds = _limits_for_rep(sender_rep)
         allowed, retry_after = db.check_and_consume_broadcast_quota(
             interaction.user.id, max_actions, window_seconds
@@ -225,13 +310,12 @@ class BroadcastsCog(commands.Cog):
         regiment = db.get_regiment(interaction.guild.id)
         sender_prefix = _format_regiment_tag(regiment, interaction.guild.name)
 
-        # Cosmetics
         color = _rep_color(sender_rep)
         badge = _rep_badge(sender_rep)
 
         embed = discord.Embed(
             title=f"{sender_prefix} {tag}",
-            description=message,
+            description=translated_msg,
             color=color
         )
         try:
@@ -239,15 +323,20 @@ class BroadcastsCog(commands.Cog):
         except Exception:
             embed.set_author(name=str(interaction.user))
 
-        # Footer: human-readable + compact standardized marker for reporting
-        # Marker format: fc|a:<author_id>|g:<guild_id>|t:<unix>
+        if did_translate and TRANSLATE_SHOW_ORIGINAL and original_msg:
+            # Embed field values are capped at 1024 chars
+            embed.add_field(
+                name=f"Original ({detected_lang})" if detected_lang else "Original",
+                value=original_msg[:1024],
+                inline=False
+            )
+
         marker = f"fc|a:{interaction.user.id}|g:{interaction.guild.id}|t:{int(now.timestamp())}"
         footer_human = f"Sent by {interaction.user} | From {interaction.guild.name} | Rep {sender_rep}{badge}"
         embed.set_footer(text=f"{footer_human}  {marker}")
 
         sent_count = 0
 
-        # Broadcast to all approved servers' configured channels
         for guild_id, channel_id in db.all_channels():
             if not db.is_guild_approved(guild_id):
                 continue
@@ -263,13 +352,22 @@ class BroadcastsCog(commands.Cog):
                 )
                 sent_count += 1
 
-                # Track for rep reactions
                 try:
                     db.track_rep_message(sent.id, interaction.user.id, str(interaction.user))
                 except Exception as e:
                     print(f"[rep] track_rep_message failed: {e}")
 
             except Exception as e:
+                # Keep your existing log, but make it more actionable
+                try:
+                    g = self.bot.get_guild(int(guild_id))
+                    me = g.me if g else None  # type: ignore
+                    if g and channel_id:
+                        ch = g.get_channel(int(channel_id))
+                        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                            print(f"[perm] guild {guild_id} channel {channel_id} -> {_perm_report_for_channel(me, ch)}")
+                except Exception:
+                    pass
                 print(f"Failed to send to guild {guild_id}: {e}")
 
         await interaction.followup.send(
@@ -289,6 +387,132 @@ class BroadcastsCog(commands.Cog):
     @app_commands.command(name="battle", description="Battle update broadcast.")
     async def battle(self, interaction: discord.Interaction, message: str):
         await self._broadcast_alert(interaction, "BATTLE", message)
+
+    # -------------------- Local Test Broadcast (THIS server only) --------------------
+    @app_commands.command(
+        name="foxcomtest",
+        description="Send a test FoxCom broadcast to THIS server only (no cross-server broadcast)."
+    )
+    async def foxcomtest(self, interaction: discord.Interaction):
+        if await _deny_if_blocked(interaction):
+            return
+
+        if not interaction.guild:
+            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
+            return
+
+        if not db.is_guild_approved(interaction.guild.id):
+            await interaction.response.send_message(
+                "This server is not approved to use FoxCom. Use /foxcomverify to request access.",
+                ephemeral=True
+            )
+            return
+
+        bc_channel_id = self._get_broadcast_channel_id_for_guild(interaction.guild.id)
+        if not bc_channel_id:
+            await interaction.response.send_message(
+                "⚠️ This server has no FoxCom broadcast channel set. Ask an admin to run /foxcomchannelset.",
+                ephemeral=True
+            )
+            return
+
+        channel = interaction.guild.get_channel(int(bc_channel_id))
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(int(bc_channel_id))
+            except discord.NotFound:
+                await interaction.response.send_message(
+                    f"⚠️ Saved broadcast channel id `{bc_channel_id}` no longer exists. Re-run /foxcomchannelset.",
+                    ephemeral=True
+                )
+                return
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "⚠️ I can’t access the saved broadcast channel. Check channel permissions (View Channel).",
+                    ephemeral=True
+                )
+                return
+            except Exception as e:
+                await interaction.response.send_message(f"⚠️ Failed to load channel: {e}", ephemeral=True)
+                return
+
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.response.send_message(
+                "⚠️ The configured broadcast channel isn't a normal text channel/thread. Re-run /foxcomchannelset.",
+                ephemeral=True
+            )
+            return
+
+        # Permission report (before send)
+        me = interaction.guild.me  # type: ignore
+        perm_report = _perm_report_for_channel(me, channel)
+
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        now = datetime.now(timezone.utc)
+        sender_rep = 0
+        try:
+            sender_rep = int(db.get_rep(interaction.user.id) or 0)
+        except Exception:
+            sender_rep = 0
+
+        regiment = db.get_regiment(interaction.guild.id)
+        sender_prefix = _format_regiment_tag(regiment, interaction.guild.name)
+
+        embed = discord.Embed(
+            title=f"{sender_prefix} TEST",
+            description="✅ This is a local test broadcast. Only this server should receive it.",
+            color=_rep_color(sender_rep)
+        )
+        try:
+            embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
+        except Exception:
+            embed.set_author(name=str(interaction.user))
+
+        badge = _rep_badge(sender_rep)
+        marker = f"fc|a:{interaction.user.id}|g:{interaction.guild.id}|t:{int(now.timestamp())}"
+        footer_human = f"Sent by {interaction.user} | From {interaction.guild.name} | Rep {sender_rep}{badge}"
+        embed.set_footer(text=f"{footer_human}  {marker}")
+
+        try:
+            sent = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            try:
+                db.track_rep_message(sent.id, interaction.user.id, str(interaction.user))
+            except Exception as e:
+                print(f"[rep] track_rep_message failed (test): {e}")
+
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ I can't post in the configured broadcast channel.\n"
+                f"**Channel:** {channel.mention} (`{bc_channel_id}`)\n"
+                f"**Bot perms:**\n{perm_report}",
+                ephemeral=True
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                "❌ Discord rejected the message.\n"
+                f"**Channel:** {channel.mention} (`{bc_channel_id}`)\n"
+                f"**Error:** `{e}`\n"
+                f"**Bot perms:**\n{perm_report}",
+                ephemeral=True
+            )
+            return
+        except Exception as e:
+            await interaction.followup.send(
+                "❌ Failed to send test broadcast.\n"
+                f"**Channel:** {channel.mention} (`{bc_channel_id}`)\n"
+                f"**Error:** `{e}`\n"
+                f"**Bot perms:**\n{perm_report}",
+                ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(
+            f"✅ Sent test broadcast to {channel.mention}.\n**Bot perms:**\n{perm_report}",
+            ephemeral=True
+        )
 
     # -------------------- Reporting (scrape last hour, current guild only) --------------------
     @app_commands.command(
@@ -335,13 +559,10 @@ class BroadcastsCog(commands.Cog):
             )
             return
 
-        # Ack immediately
         if not interaction.response.is_done():
             await interaction.response.send_message("✅ Your report has been submitted for review.", ephemeral=True)
 
         cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
-
-        # Stable filter: find embeds whose footer marker matches reported user id
         needle = f"fc|a:{user.id}|"
 
         scanned = 0
@@ -352,7 +573,6 @@ class BroadcastsCog(commands.Cog):
             async for msg in bc_channel.history(limit=250, after=cutoff, oldest_first=False):
                 scanned += 1
 
-                # Broadcasts are posted by the bot
                 if not self.bot.user or msg.author.id != self.bot.user.id:
                     continue
                 if not msg.embeds:

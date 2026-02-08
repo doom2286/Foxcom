@@ -203,6 +203,44 @@ class AdminCog(commands.Cog):
             ephemeral=True
         )
 
+
+
+    @app_commands.guilds(ADMIN_GUILD_OBJ)
+    @app_commands.command(
+        name="toggletranslation",
+        description="Globally enable/disable auto-translation for all servers."
+    )
+    async def toggletranslation(self, interaction: discord.Interaction):
+        if await deny_if_blocked(interaction):
+            return
+        if not self._guard_admin(interaction):
+            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
+            return
+
+        new_state = db.toggle_global_translation_enabled(default=True)
+        await interaction.response.send_message(
+            f"Global auto-translation is now **{'ENABLED' if new_state else 'DISABLED'}** (applies to all servers).",
+            ephemeral=True
+        )
+
+    @app_commands.guilds(ADMIN_GUILD_OBJ)
+    @app_commands.command(
+        name="translationstatus",
+        description="Show whether global auto-translation is enabled (Admin only in FoxCom)."
+    )
+    async def translationstatus(self, interaction: discord.Interaction):
+        if await deny_if_blocked(interaction):
+            return
+        if not self._guard_admin(interaction):
+            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
+            return
+
+        enabled = db.get_global_translation_enabled(default=True)
+        await interaction.response.send_message(
+            f"Global auto-translation: **{'ENABLED' if enabled else 'DISABLED'}**.",
+            ephemeral=True
+        )
+
     @app_commands.guilds(ADMIN_GUILD_OBJ)
     @app_commands.command(
         name="dbstatus",

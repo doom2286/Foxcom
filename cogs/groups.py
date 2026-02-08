@@ -11,6 +11,21 @@ from discord.ext import commands
 
 from core import db  # uses your sqlite tables + approval system
 
+from core.config import load_config
+
+# Translation helper; fall back to no-op if missing
+try:
+    from core.translate import maybe_translate_to_english  # type: ignore
+except Exception:
+    async def maybe_translate_to_english(api_key: str, text: str, *, enabled: bool = True, min_chars: int = 12):
+        return text, None, False, None
+
+CFG = load_config()
+GOOGLE_TRANSLATE_API_KEY = (CFG.get("google_translate_api_key") or "").strip()
+TRANSLATE_ENABLED = str(CFG.get("translate_enabled") or "true").strip().lower() in ("1","true","yes","y","on")
+TRANSLATE_MIN_CHARS = int(CFG.get("translate_min_chars") or 12)
+TRANSLATE_SHOW_ORIGINAL = str(CFG.get("translate_show_original") or "true").strip().lower() in ("1","true","yes","y","on")
+
 
 # Rate limit: seconds per (group_id, user_id) for group broadcast commands
 GROUP_BROADCAST_COOLDOWN = 60
@@ -28,7 +43,7 @@ def _sanitize_broadcast_text(text: str) -> str:
         return ""
     text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
     text = re.sub(r"<@&\d+>", "[role]", text)      # role mention
-    text = re.sub(r"<@!?\d+>", "[user]", text)     # user mention
+    text = re.sub(r"<@!?\\d+>", "[user]", text)     # user mention
     text = re.sub(r"<#\d+>", "[channel]", text)    # channel mention
     return text
 
@@ -234,7 +249,157 @@ class Groups(commands.Cog):
         embed = discord.Embed(title="Groups (this server)", description="\n".join(lines))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
     # =========================
+    # /publicgroups
+    # =========================
+    @app_commands.command(name="publicgroups", description="Browse groups that are marked public.")
+    @app_commands.describe(search="Optional name search", page="Page number (starts at 1)")
+    async def publicgroups(self, interaction: discord.Interaction, search: str = "", page: int = 1):
+        if not await self._require_guild(interaction):
+            return
+        if not await self._require_approved(interaction):
+            return
+
+        page = max(1, int(page or 1))
+        search = (search or "").strip()
+
+        PAGE_SIZE = 10
+        offset = (page - 1) * PAGE_SIZE
+
+        conn = db.connect()
+        cur = conn.cursor()
+
+        # Total count for pagination
+        if search:
+            like = f"%{search}%"
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM groups WHERE visibility='public' AND name LIKE ?",
+                (like,),
+            )
+        else:
+            cur.execute("SELECT COUNT(*) AS c FROM groups WHERE visibility='public'")
+        total = int(cur.fetchone()["c"] or 0)
+
+        if total == 0:
+            conn.close()
+            await interaction.response.send_message("No public groups found.", ephemeral=True)
+            return
+
+        # Page data with population counts (servers + users)
+        where_sql = "g.visibility='public'"
+        params = []
+        if search:
+            where_sql += " AND g.name LIKE ?"
+            params.append(f"%{search}%")
+
+        cur.execute(
+            f"""
+            SELECT
+                g.group_id,
+                g.name,
+                g.created_at,
+                COUNT(DISTINCT gs.guild_id) AS server_count,
+                COUNT(DISTINCT gur.user_id) AS member_count
+            FROM groups g
+            LEFT JOIN group_servers gs ON gs.group_id = g.group_id
+            LEFT JOIN group_user_roles gur ON gur.group_id = g.group_id
+            WHERE {where_sql}
+            GROUP BY g.group_id
+            ORDER BY g.name COLLATE NOCASE ASC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, PAGE_SIZE, offset),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            await interaction.response.send_message("No results on that page.", ephemeral=True)
+            return
+
+        max_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = min(page, max_pages)
+
+        title = "Public Groups"
+        if search:
+            title += f" — search: {search}"
+
+        embed = discord.Embed(title=title)
+        embed.set_footer(text=f"Page {page}/{max_pages} • Total: {total}")
+
+        # Embed field limits are tight; keep each entry short.
+        lines = []
+        for r in rows:
+            gid = int(r["group_id"])
+            name = str(r["name"])
+            servers = int(r["server_count"] or 0)
+            members = int(r["member_count"] or 0)
+            lines.append(f"• **{name}** — {servers} servers • {members} members • ID `{gid}`")
+
+        embed.description = "\n".join(lines)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # =========================
+    # =========================
+    # /grouptranslate (user setting)
+    # =========================
+    @app_commands.command(name="grouptranslate", description="Toggle auto-translation for YOUR group broadcasts.")
+    async def grouptranslate(self, interaction: discord.Interaction):
+        if not await self._require_guild(interaction):
+            return
+        if not await self._require_approved(interaction):
+            return
+
+        new_state = db.toggle_user_group_translate_enabled(
+            interaction.user.id,
+            str(interaction.user),
+            default=True,
+        )
+        state_txt = "ON" if new_state else "OFF"
+        await interaction.response.send_message(
+            f"🌐 Your group-message translation is now **{state_txt}**.",
+            ephemeral=True,
+        )
+
+    # =========================
+    # /groupglobaltranslate (owner/leader)
+    # =========================
+    @app_commands.command(name="groupglobaltranslate", description="Toggle translation for everyone in a group (owner/leader).")
+    @app_commands.describe(groupname="Group name")
+    async def groupglobaltranslate(self, interaction: discord.Interaction, groupname: str):
+        if not await self._require_guild(interaction):
+            return
+        if not await self._require_approved(interaction):
+            return
+
+        groupname = groupname.strip()
+        group_id = db.get_group_id(groupname)
+        if not group_id:
+            await interaction.response.send_message("Group not found.", ephemeral=True)
+            return
+
+        # Only allow toggling from a server that is actually in the group
+        if not db.guild_in_group(group_id, interaction.guild.id):
+            await interaction.response.send_message("This server is not in that group.", ephemeral=True)
+            return
+
+        role = db.get_user_group_role(group_id, interaction.user.id)
+        if role not in ("owner", "leader"):
+            await interaction.response.send_message(
+                "You must be a **group leader** (or owner) to do that.",
+                ephemeral=True,
+            )
+            return
+
+        new_state = db.toggle_group_global_translate_enabled(group_id, default=True)
+        state_txt = "ENABLED" if new_state else "DISABLED"
+        await interaction.response.send_message(
+            f"🌐 Group translation is now **{state_txt}** for **{groupname}**.",
+            ephemeral=True,
+        )
+
     # /makegrouplead
     # =========================
     @app_commands.command(name="makegrouplead", description="Promote a user to group leader.")
@@ -321,16 +486,14 @@ class Groups(commands.Cog):
     # /removemembers
     # =========================
     @app_commands.command(name="removemembers", description="Remove a server from a group (leader/owner).")
-    @app_commands.describe(groupname="Group name", servername="Server name to remove (must match stored name)")
-    async def removemembers(self, interaction: discord.Interaction, groupname: str, servername: str):
+    @app_commands.describe(groupname="Group name", guild_id="Server ID to remove (use /listmembers first)")
+    async def removemembers(self, interaction: discord.Interaction, groupname: str, guild_id: str):
         if not await self._require_guild(interaction):
             return
         if not await self._require_approved(interaction):
             return
 
         groupname = groupname.strip()
-        servername = servername.strip()
-
         group_id = db.get_group_id(groupname)
         if not group_id:
             await interaction.response.send_message("Group not found.", ephemeral=True)
@@ -341,19 +504,24 @@ class Groups(commands.Cog):
             await interaction.response.send_message("You must be a **group leader** (or owner) to do that.", ephemeral=True)
             return
 
-        removed = db.remove_server_from_group_by_name(group_id, servername)
+        try:
+            gid = int(guild_id.strip())
+        except Exception:
+            await interaction.response.send_message("Invalid server ID.", ephemeral=True)
+            return
+
+        removed = db.leave_group(group_id, gid)
         if removed:
-            await interaction.response.send_message(f"✅ Removed **{servername}** from **{groupname}**.", ephemeral=True)
+            await interaction.response.send_message("✅ Removed that server from the group.", ephemeral=True)
         else:
-            await interaction.response.send_message(
-                "No matching server name found in that group.\nTip: run `/listmembers` and copy the name exactly.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("That server is not in the group.", ephemeral=True)
 
     # =========================
-    # Group broadcast core
+    # /groupmsg  (send to all servers in a group)
     # =========================
-    async def _group_broadcast(self, interaction: discord.Interaction, groupname: str, kind: str, message: str):
+    @app_commands.command(name="groupmsg", description="Send a message to all servers in a group.")
+    @app_commands.describe(groupname="Group name", message="Message to send")
+    async def groupmsg(self, interaction: discord.Interaction, groupname: str, message: str):
         if not await self._require_guild(interaction):
             return
         if not await self._require_approved(interaction):
@@ -365,80 +533,90 @@ class Groups(commands.Cog):
             await interaction.response.send_message("Group not found.", ephemeral=True)
             return
 
+        # Require that THIS server is in the group
         if not db.guild_in_group(group_id, interaction.guild.id):
             await interaction.response.send_message("This server is not in that group.", ephemeral=True)
             return
 
         ok, wait_s = self._cooldown_ok(group_id, interaction.user.id)
         if not ok:
-            await interaction.response.send_message(f"Slow down — try again in **{wait_s}s**.", ephemeral=True)
+            await interaction.response.send_message(f"⏳ Cooldown: wait **{wait_s}s** before sending again.", ephemeral=True)
             return
 
-        clean = _sanitize_broadcast_text(message or "")
-        if not clean.strip():
-            clean = "(no details provided)"
+        text = (message or "").strip()
+        if not text:
+            await interaction.response.send_message("Message cannot be empty.", ephemeral=True)
+            return
 
-        embed = discord.Embed(
-            title=f"[GROUP {kind.upper()}] {groupname}",
-            description=clean,
-            timestamp=discord.utils.utcnow()
-        )
-        embed.set_footer(text=f"Sent by {interaction.user} • From {interaction.guild.name}")
-        if interaction.user.display_avatar:
-            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        # hard limit to prevent mega spam
+        if len(text) > 800:
+            await interaction.response.send_message("Message too long (max 800 characters).", ephemeral=True)
+            return
 
-        await interaction.response.send_message(f"📡 Sending **{kind}** to group **{groupname}**…", ephemeral=True)
+        text = _sanitize_broadcast_text(text)
 
-        servers = db.list_servers_in_group(group_id)
+        # Translate (user setting + group global toggle + global config)
+        do_translate = TRANSLATE_ENABLED and bool(GOOGLE_TRANSLATE_API_KEY)
+        user_translate_on = db.get_user_group_translate_enabled(interaction.user.id, default=True)
+        group_translate_on = db.get_group_global_translate_enabled(group_id, default=True)
+        do_translate = do_translate and user_translate_on and group_translate_on
 
+        translated_text = text
+        detected_lang = None
+        did_translate = False
+        err = None
+
+        if do_translate and len(text) >= TRANSLATE_MIN_CHARS:
+            translated_text, detected_lang, did_translate, err = await maybe_translate_to_english(
+                GOOGLE_TRANSLATE_API_KEY,
+                text,
+                enabled=True,
+                min_chars=TRANSLATE_MIN_CHARS
+            )
+
+        # Build embed
+        embed = discord.Embed(title=f"📣 Group Message — {groupname}", description=translated_text)
+        embed.set_author(name=str(interaction.user), icon_url=getattr(interaction.user.display_avatar, "url", None))
+        embed.timestamp = discord.utils.utcnow()
+
+        if did_translate and TRANSLATE_SHOW_ORIGINAL:
+            embed.add_field(name="Original", value=text[:1024], inline=False)
+        if detected_lang and did_translate:
+            embed.set_footer(text=f"Translated from {detected_lang}")
+
+        # Send to all servers in group
+        targets = db.list_servers_in_group(group_id)
         sent = 0
         failed = 0
 
-        for s in servers:
-            gid = int(s["guild_id"])
-            channel_id = _get_broadcast_channel_id_for_guild(gid)
+        for r in targets:
+            guild_id = int(r["guild_id"])
+            channel_id = _get_broadcast_channel_id_for_guild(guild_id)
             if not channel_id:
                 failed += 1
                 continue
 
-            channel = self.bot.get_channel(channel_id)
-            if channel is None:
-                try:
-                    channel = await self.bot.fetch_channel(channel_id)
-                except Exception:
-                    failed += 1
-                    continue
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                failed += 1
+                continue
+
+            ch = guild.get_channel(channel_id)
+            if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                failed += 1
+                continue
 
             try:
-                await channel.send(embed=embed)
+                await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                 sent += 1
             except Exception:
                 failed += 1
 
-        try:
-            await interaction.followup.send(f"✅ Done. Sent: **{sent}** | Failed: **{failed}**", ephemeral=True)
-        except Exception:
-            pass
-
-    # =========================
-    # /groupqrf /groupbattle /grouplogi
-    # =========================
-    @app_commands.command(name="groupqrf", description="Send a QRF broadcast to servers in a group.")
-    @app_commands.describe(groupname="Group name", message="Details")
-    async def groupqrf(self, interaction: discord.Interaction, groupname: str, message: str):
-        await self._group_broadcast(interaction, groupname, "qrf", message)
-
-    @app_commands.command(name="groupbattle", description="Send a battle broadcast to servers in a group.")
-    @app_commands.describe(groupname="Group name", message="Details")
-    async def groupbattle(self, interaction: discord.Interaction, groupname: str, message: str):
-        await self._group_broadcast(interaction, groupname, "battle", message)
-
-    @app_commands.command(name="grouplogi", description="Send a logistics broadcast to servers in a group.")
-    @app_commands.describe(groupname="Group name", message="Details")
-    async def grouplogi(self, interaction: discord.Interaction, groupname: str, message: str):
-        await self._group_broadcast(interaction, groupname, "logi", message)
+        await interaction.response.send_message(
+            f"✅ Sent to **{sent}** server(s). Failed: **{failed}**." + (f"\nTranslation error: {err}" if err else ""),
+            ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Groups(bot))
-
