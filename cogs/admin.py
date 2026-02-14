@@ -1,289 +1,237 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
+
 from core import db
 from core.config import load_config
+from core.utils import utc_now_iso
 
 CFG = load_config()
 ADMIN_SERVER_ID = int(CFG.get("admin_server_id") or 0)
+
+# Used to scope admin-only slash commands to the control server
 ADMIN_GUILD_OBJ = discord.Object(id=ADMIN_SERVER_ID)
 
 
-async def deny_if_blocked(interaction: discord.Interaction) -> bool:
-    # Allow control-server admins to bypass blocks
-    if interaction.guild and interaction.guild.id == ADMIN_SERVER_ID:
-        if getattr(interaction.user, "guild_permissions", None) and interaction.user.guild_permissions.administrator:
-            return False
+def _in_control_server(interaction: discord.Interaction) -> bool:
+    return interaction.guild is not None and interaction.guild.id == ADMIN_SERVER_ID
 
-    if db.is_user_blocked(interaction.user.id):
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send("⛔ You are blocked from using FoxCom commands.", ephemeral=True)
-            else:
-                await interaction.response.send_message("⛔ You are blocked from using FoxCom commands.", ephemeral=True)
-        except:
-            pass
-        return True
 
-    return False
+def _is_admin(interaction: discord.Interaction) -> bool:
+    return bool(getattr(interaction.user, "guild_permissions", None) and interaction.user.guild_permissions.administrator)
+
+
+class _Pager(discord.ui.View):
+    def __init__(self, make_embed_fn, total_items: int, per_page: int = 8):
+        super().__init__(timeout=180)
+        self.make_embed_fn = make_embed_fn
+        self.per_page = max(1, int(per_page))
+        self.page = 0
+        self.total_items = int(total_items)
+        self.max_page = max(0, (self.total_items - 1) // self.per_page)
+
+        self.prev_button.disabled = True
+        self.next_button.disabled = (self.max_page == 0)
+
+    async def _refresh(self, interaction: discord.Interaction):
+        self.prev_button.disabled = (self.page <= 0)
+        self.next_button.disabled = (self.page >= self.max_page)
+        await interaction.response.edit_message(embed=self.make_embed_fn(self.page, self.per_page), view=self)
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < self.max_page:
+            self.page += 1
+        await self._refresh(interaction)
 
 
 class AdminCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    def _guard_admin(self, interaction: discord.Interaction) -> bool:
-        if interaction.guild is None or interaction.guild.id != ADMIN_SERVER_ID:
-            return False
-        return bool(getattr(interaction.user, "guild_permissions", None) and interaction.user.guild_permissions.administrator)
-
+    # ---------------------------------------------
+    # /foxcomlistservers  (live: bot.guilds cache)
+    # Hidden from other servers via @guilds()
+    # ---------------------------------------------
+    @app_commands.command(name="foxcomlistservers", description="List ALL servers the bot is currently in (control server only).")
     @app_commands.guilds(ADMIN_GUILD_OBJ)
-    @app_commands.command(
-        name="aprovedregi",
-        description="List all approved regiments and server info (Admin only in FoxCom)."
-    )
-    async def aprovedregi(self, interaction: discord.Interaction):
-        if await deny_if_blocked(interaction):
+    @app_commands.default_permissions(administrator=True)
+    async def foxcomlistservers(self, interaction: discord.Interaction):
+        # Extra runtime guard (defense in depth)
+        if not _in_control_server(interaction):
+            await interaction.response.send_message("❌ Use this in the FoxCom control server.", ephemeral=True)
             return
-        if not self._guard_admin(interaction):
-            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
-            return
-
-        rows = db.list_approved()
-        if not rows:
-            await interaction.response.send_message("⚠️ No approved servers found.", ephemeral=True)
+        if not _is_admin(interaction):
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
 
-        embed = discord.Embed(title="📋 Approved Regiments", color=discord.Color.green())
-        for r in rows:
-            server_id = str(r["guild_id"])
-            regiment = r["regiment"] or "Unknown"
-            server_name = r["server_name"] or "Unknown Server"
-            approved_by = r["approved_by"] or "Unknown"
-            approved_at = r["approved_at"] or "Unknown"
+        guilds = sorted(list(self.bot.guilds), key=lambda g: (g.name or "").lower())
+        total = len(guilds)
 
-            g = self.bot.get_guild(int(server_id))
-            live_name = g.name if g else server_name
-
-            embed.add_field(
-                name=f"{regiment}",
-                value=(
-                    f"**Server:** {live_name}\n"
-                    f"**Server ID:** `{server_id}`\n"
-                    f"**Approved By:** {approved_by}\n"
-                    f"**Approved At:** {approved_at}"
-                ),
-                inline=False
+        def make_embed(page: int, per_page: int) -> discord.Embed:
+            max_page = max(1, (total - 1) // per_page + 1)
+            emb = discord.Embed(
+                title="🌐 Bot Installed Servers",
+                description=f"Page {page + 1}/{max_page} • Total: {total}",
+                color=discord.Color.blurple(),
             )
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            if total == 0:
+                emb.add_field(name="(none)", value="The bot isn't in any servers.", inline=False)
+                return emb
 
+            start = page * per_page
+            end = start + per_page
+            for g in guilds[start:end]:
+                emb.add_field(
+                    name=g.name or "(unknown)",
+                    value=f"ID: `{g.id}` • Members: `{getattr(g, 'member_count', 'N/A')}`",
+                    inline=False,
+                )
+            return emb
+
+        view = _Pager(make_embed, total_items=total, per_page=8)
+        await interaction.response.send_message(embed=make_embed(0, view.per_page), view=view, ephemeral=True)
+
+    # ---------------------------------------------
+    # /foxcomlistapproved (DB: approved_servers)
+    # Hidden from other servers via @guilds()
+    # ---------------------------------------------
+    @app_commands.command(name="foxcomlistapproved", description="List all approved (verified) servers (control server only).")
     @app_commands.guilds(ADMIN_GUILD_OBJ)
-    @app_commands.command(
-        name="clearapproved",
-        description="Clear all approved regiments (Admin only in FoxCom)."
-    )
-    async def clearapproved(self, interaction: discord.Interaction):
-        if await deny_if_blocked(interaction):
+    @app_commands.default_permissions(administrator=True)
+    async def foxcomlistapproved(self, interaction: discord.Interaction):
+        if not _in_control_server(interaction):
+            await interaction.response.send_message("❌ Use this in the FoxCom control server.", ephemeral=True)
             return
-        if not self._guard_admin(interaction):
-            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
+        if not _is_admin(interaction):
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
             return
 
-        class ConfirmClear(discord.ui.View):
-            def __init__(self, caller_id: int):
-                super().__init__(timeout=30)
-                self.caller_id = caller_id
-                self.value = None
+        try:
+            conn = db.connect()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT guild_id, server_name, regiment, approved_at, approved_by "
+                "FROM approved_servers ORDER BY approved_at DESC"
+            )
+            rows = cur.fetchall() or []
+            conn.close()
+        except Exception as e:
+            await interaction.response.send_message(f"❌ DB error: {e}", ephemeral=True)
+            return
 
-            async def _guard(self, i: discord.Interaction) -> bool:
-                if i.user.id != self.caller_id:
-                    await i.response.send_message("❌ You can't confirm someone else's command.", ephemeral=True)
-                    return False
-                return True
+        total = len(rows)
 
-            @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
-            async def confirm(self, i: discord.Interaction, button: discord.ui.Button):
-                if not await self._guard(i):
-                    return
-                self.value = True
-                await i.response.defer(ephemeral=True)
-                self.stop()
+        def make_embed(page: int, per_page: int) -> discord.Embed:
+            max_page = max(1, (total - 1) // per_page + 1)
+            emb = discord.Embed(
+                title="✅ Approved Servers",
+                description=f"Page {page + 1}/{max_page} • Total: {total}",
+                color=discord.Color.green(),
+            )
 
-            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-            async def cancel(self, i: discord.Interaction, button: discord.ui.Button):
-                if not await self._guard(i):
-                    return
-                self.value = False
-                await i.response.defer(ephemeral=True)
-                self.stop()
+            if total == 0:
+                emb.add_field(name="(none)", value="No approved servers found.", inline=False)
+                return emb
 
-        view = ConfirmClear(caller_id=interaction.user.id)
+            start = page * per_page
+            end = start + per_page
+            for r in rows[start:end]:
+                name = r["server_name"] or "(unknown)"
+                gid = r["guild_id"]
+                reg = (r["regiment"] or "").strip() or "N/A"
+                approved_at = r["approved_at"] or "N/A"
+                approved_by = r["approved_by"] or "N/A"
+                emb.add_field(
+                    name=f"{name}",
+                    value=f"ID: `{gid}`\nRegiment: **{reg}**\nApproved: `{approved_at}`\nBy: `{approved_by}`",
+                    inline=False,
+                )
+            return emb
+
+        view = _Pager(make_embed, total_items=total, per_page=8)
+        await interaction.response.send_message(embed=make_embed(0, view.per_page), view=view, ephemeral=True)
+
+    # ---------------------------------------------
+    # /foxcomrevoke <guild_id> [reason]
+    # Hidden from other servers via @guilds()
+    # ---------------------------------------------
+    @app_commands.command(name="foxcomrevoke", description="Revoke a server's verification (control server only).")
+    @app_commands.describe(guild_id="The server (guild) ID to revoke", reason="Optional reason for revocation")
+    @app_commands.guilds(ADMIN_GUILD_OBJ)
+    @app_commands.default_permissions(administrator=True)
+    async def foxcomrevoke(self, interaction: discord.Interaction, guild_id: str, reason: str = ""):
+        if not _in_control_server(interaction):
+            await interaction.response.send_message("❌ Use this in the FoxCom control server.", ephemeral=True)
+            return
+        if not _is_admin(interaction):
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+
+        try:
+            gid = int(str(guild_id).strip())
+        except Exception:
+            await interaction.response.send_message("❌ Invalid guild_id. Provide a numeric server ID.", ephemeral=True)
+            return
+
+        # Look up stored server name (optional)
+        server_name = None
+        try:
+            conn = db.connect()
+            cur = conn.cursor()
+            cur.execute("SELECT server_name FROM approved_servers WHERE guild_id=?", (int(gid),))
+            r = cur.fetchone()
+            if r:
+                server_name = r["server_name"]
+            conn.close()
+        except Exception:
+            pass
+
+        # Revoke: delete from approved + clear channels
+        try:
+            conn = db.connect()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM approved_servers WHERE guild_id=?", (int(gid),))
+            removed_approved = cur.rowcount > 0
+            cur.execute("DELETE FROM channels WHERE guild_id=?", (int(gid),))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            await interaction.response.send_message(f"❌ DB error while revoking: {e}", ephemeral=True)
+            return
+
+        if not removed_approved:
+            await interaction.response.send_message("⚠️ That server was not approved (no changes made).", ephemeral=True)
+            return
+
+        # Log to the control server channel where the command ran
+        try:
+            log_embed = discord.Embed(
+                title="⛔ Verification Revoked",
+                color=discord.Color.red(),
+                timestamp=discord.utils.utcnow(),
+            )
+            log_embed.add_field(name="Server", value=server_name or "(unknown)", inline=False)
+            log_embed.add_field(name="Guild ID", value=f"`{gid}`", inline=False)
+            log_embed.add_field(name="Revoked By", value=str(interaction.user), inline=False)
+            log_embed.add_field(name="Reason", value=(reason or "").strip() or "N/A", inline=False)
+            log_embed.set_footer(text=f"Revoked at {utc_now_iso()}")
+            await interaction.channel.send(embed=log_embed)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
         await interaction.response.send_message(
-            "⚠️ Are you sure you want to clear **all approved regiments**? This cannot be undone.",
+            f"✅ Revoked verification for `{gid}`. (Also cleared its /foxcomchannelset channel.)",
             ephemeral=True,
-            view=view
         )
-        await view.wait()
-
-        if view.value:
-            db.clear_approved()
-            await interaction.followup.send("✅ All approved regiments have been cleared.", ephemeral=True)
-        else:
-            await interaction.followup.send("❌ Operation cancelled.", ephemeral=True)
-
-    @app_commands.guilds(ADMIN_GUILD_OBJ)
-    @app_commands.command(
-        name="blockuser",
-        description="Block a user from using FoxCom commands (Admin only in FoxCom)."
-    )
-    @app_commands.describe(user="The user to block", reason="Optional reason")
-    async def blockuser(self, interaction: discord.Interaction, user: discord.User, reason: str = ""):
-        if await deny_if_blocked(interaction):
-            return
-        if not self._guard_admin(interaction):
-            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
-            return
-
-        db.block_user(user.id, str(user), str(interaction.user), reason)
-        msg = f"✅ Blocked **{user}** (`{user.id}`) from using FoxCom commands."
-        if reason.strip():
-            msg += f"\n📝 Reason: {reason.strip()}"
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @app_commands.guilds(ADMIN_GUILD_OBJ)
-    @app_commands.command(
-        name="unblockuser",
-        description="Unblock a user from using FoxCom commands (Admin only in FoxCom)."
-    )
-    @app_commands.describe(user="The user to unblock")
-    async def unblockuser(self, interaction: discord.Interaction, user: discord.User):
-        if await deny_if_blocked(interaction):
-            return
-        if not self._guard_admin(interaction):
-            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
-            return
-
-        removed = db.unblock_user(user.id)
-
-        if removed:
-            await interaction.response.send_message(
-                f"✅ Unblocked **{user}** (`{user.id}`).",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                f"ℹ️ **{user}** (`{user.id}`) was not blocked.",
-                ephemeral=True
-            )
-
-    @app_commands.guilds(ADMIN_GUILD_OBJ)
-    @app_commands.command(
-        name="setuserrep",
-        description="Set a user's reputation (Admin only in FoxCom)."
-    )
-    @app_commands.describe(user="The user to set rep for", rep="The rep value to set")
-    async def setuserrep(self, interaction: discord.Interaction, user: discord.User, rep: int):
-        if await deny_if_blocked(interaction):
-            return
-        if not self._guard_admin(interaction):
-            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
-            return
-
-        # Optional sanity limits (adjust/remove if you want)
-        if rep < -100000 or rep > 100000:
-            await interaction.response.send_message("❌ Rep value out of range.", ephemeral=True)
-            return
-
-        # Requires db.set_user_rep(...) implemented in core/db.py
-        db.set_user_rep(user.id, str(user), rep, str(interaction.user))
-
-        await interaction.response.send_message(
-            f"✅ Set rep for **{user}** (`{user.id}`) to **{rep}**.",
-            ephemeral=True
-        )
-
-
-
-    @app_commands.guilds(ADMIN_GUILD_OBJ)
-    @app_commands.command(
-        name="toggletranslation",
-        description="Globally enable/disable auto-translation for all servers."
-    )
-    async def toggletranslation(self, interaction: discord.Interaction):
-        if await deny_if_blocked(interaction):
-            return
-        if not self._guard_admin(interaction):
-            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
-            return
-
-        new_state = db.toggle_global_translation_enabled(default=True)
-        await interaction.response.send_message(
-            f"Global auto-translation is now **{'ENABLED' if new_state else 'DISABLED'}** (applies to all servers).",
-            ephemeral=True
-        )
-
-    @app_commands.guilds(ADMIN_GUILD_OBJ)
-    @app_commands.command(
-        name="translationstatus",
-        description="Show whether global auto-translation is enabled (Admin only in FoxCom)."
-    )
-    async def translationstatus(self, interaction: discord.Interaction):
-        if await deny_if_blocked(interaction):
-            return
-        if not self._guard_admin(interaction):
-            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
-            return
-
-        enabled = db.get_global_translation_enabled(default=True)
-        await interaction.response.send_message(
-            f"Global auto-translation: **{'ENABLED' if enabled else 'DISABLED'}**.",
-            ephemeral=True
-        )
-
-    @app_commands.guilds(ADMIN_GUILD_OBJ)
-    @app_commands.command(
-        name="dbstatus",
-        description="Show database row counts + last prune time (Admin only in FoxCom)."
-    )
-    async def dbstatus(self, interaction: discord.Interaction):
-        if await deny_if_blocked(interaction):
-            return
-        if not self._guard_admin(interaction):
-            await interaction.response.send_message("❌ Admins only in FoxCom control server.", ephemeral=True)
-            return
-
-        counts = db.counts()
-        last_prune = db.get_last_prune()
-
-        embed = discord.Embed(title="🗄️ FoxCom DB Status", color=discord.Color.dark_grey())
-        embed.add_field(name="Last Prune (UTC)", value=(last_prune or "Never"), inline=False)
-
-        embed.add_field(
-            name="Core Tables",
-            value=(
-                f"channels: **{counts['channels']}**\n"
-                f"approved_servers: **{counts['approved_servers']}**\n"
-                f"pending_requests: **{counts['pending_requests']}**\n"
-                f"feedback_config: **{counts['feedback_config']}**\n"
-                f"banlist: **{counts['banlist']}**"
-            ),
-            inline=False
-        )
-
-        embed.add_field(
-            name="Reputation Tables",
-            value=(
-                f"rep_users: **{counts['rep_users']}**\n"
-                f"rep_messages (<=24h): **{counts['rep_messages']}**\n"
-                f"rep_votes: **{counts['rep_votes']}**"
-            ),
-            inline=False
-        )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AdminCog(bot))
-
