@@ -113,6 +113,15 @@ def _should_prune_rep(now_utc: datetime, min_interval_seconds: int = 10 * 60) ->
         return False
 
 
+def _in_control_server(interaction: discord.Interaction) -> bool:
+    return interaction.guild is not None and interaction.guild.id == ADMIN_SERVER_ID
+
+
+def _is_admin(interaction: discord.Interaction) -> bool:
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and getattr(perms, "administrator", False))
+
+
 async def _deny_if_blocked(interaction: discord.Interaction) -> bool:
     if interaction.guild and interaction.guild.id == ADMIN_SERVER_ID:
         perms = getattr(interaction.user, "guild_permissions", None)
@@ -141,8 +150,6 @@ def _perm_report_for_channel(me: discord.Member | None, channel: discord.abc.Gui
     if me is None:
         return "Bot member not available (cache)."
 
-    # Threads are a bit special; use parent channel permissions as a baseline,
-    # and also report thread state.
     base_channel = channel.parent if isinstance(channel, discord.Thread) else channel
     perms = base_channel.permissions_for(me)
 
@@ -190,6 +197,34 @@ class BroadcastsCog(commands.Cog):
             return None
         ch = self.bot.get_channel(report_channel_id)
         return ch if isinstance(ch, discord.TextChannel) else None
+
+    def _find_fallback_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        """
+        If a guild doesn't have /foxcomchannelset configured, find a channel the bot can post in.
+        Preference order:
+          1) system_channel (if sendable)
+          2) first text channel with view+send perms
+        """
+        me = guild.me  # type: ignore
+        if guild.system_channel and me:
+            try:
+                perms = guild.system_channel.permissions_for(me)
+                if perms.view_channel and perms.send_messages:
+                    return guild.system_channel
+            except Exception:
+                pass
+
+        if not me:
+            return None
+
+        for ch in guild.text_channels:
+            try:
+                perms = ch.permissions_for(me)
+                if perms.view_channel and perms.send_messages:
+                    return ch
+            except Exception:
+                continue
+        return None
 
     async def _broadcast_alert(self, interaction: discord.Interaction, tag: str, message: str):
         if await _deny_if_blocked(interaction):
@@ -256,7 +291,6 @@ class BroadcastsCog(commands.Cog):
                     min_chars=TRANSLATE_MIN_CHARS
                 )
             except Exception as e:
-                # Fail open: broadcast original if translate fails
                 print(f"[translate] failed: {e}")
                 translated_msg = message
                 detected_lang = None
@@ -324,7 +358,6 @@ class BroadcastsCog(commands.Cog):
             embed.set_author(name=str(interaction.user))
 
         if did_translate and TRANSLATE_SHOW_ORIGINAL and original_msg:
-            # Embed field values are capped at 1024 chars
             embed.add_field(
                 name=f"Original ({detected_lang})" if detected_lang else "Original",
                 value=original_msg[:1024],
@@ -358,7 +391,6 @@ class BroadcastsCog(commands.Cog):
                     print(f"[rep] track_rep_message failed: {e}")
 
             except Exception as e:
-                # Keep your existing log, but make it more actionable
                 try:
                     g = self.bot.get_guild(int(guild_id))
                     me = g.me if g else None  # type: ignore
@@ -375,6 +407,93 @@ class BroadcastsCog(commands.Cog):
             ephemeral=True
         )
 
+    # -------------------- NEW: Admin Broadcast (control server only) --------------------
+    async def _admin_broadcast(self, interaction: discord.Interaction, message: str):
+        if await _deny_if_blocked(interaction):
+            return
+
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Must be used in a server.", ephemeral=True)
+            return
+
+        if not _in_control_server(interaction):
+            await interaction.response.send_message("❌ Use this in the FoxCom control server only.", ephemeral=True)
+            return
+
+        if not _is_admin(interaction):
+            await interaction.response.send_message("❌ Admins only.", ephemeral=True)
+            return
+
+        if contains_disallowed_mentions(message):
+            await interaction.response.send_message(
+                "Mentions are not allowed (no @everyone, @here, roles, user pings, or '@').",
+                ephemeral=True
+            )
+            return
+
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        now = datetime.now(timezone.utc)
+
+        embed = discord.Embed(
+            title="🛠️ FOXCOM ADMIN",
+            description=message,
+            color=discord.Color.red()
+        )
+        try:
+            embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
+        except Exception:
+            embed.set_author(name=str(interaction.user))
+
+        marker = f"fc|admin:1|a:{interaction.user.id}|g:{interaction.guild.id}|t:{int(now.timestamp())}"
+        embed.set_footer(text=f"Admin broadcast by {interaction.user}  {marker}")
+
+        # Build a quick lookup for configured broadcast channels
+        chan_map: dict[int, int] = {}
+        try:
+            for gid, cid in db.all_channels():
+                chan_map[int(gid)] = int(cid)
+        except Exception:
+            chan_map = {}
+
+        sent_count = 0
+        fallback_count = 0
+        no_channel_count = 0
+
+        # Send to ALL guilds the bot is in (approved or not)
+        for g in list(self.bot.guilds):
+            try:
+                target = None
+
+                configured_id = chan_map.get(int(g.id))
+                if configured_id:
+                    ch = self.bot.get_channel(int(configured_id))
+                    if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                        target = ch
+
+                if target is None:
+                    fb = self._find_fallback_channel(g)
+                    if fb:
+                        target = fb
+                        fallback_count += 1
+                    else:
+                        no_channel_count += 1
+                        continue
+
+                await target.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                sent_count += 1
+
+            except Exception as e:
+                print(f"[admin] Failed to send to guild {g.id} ({g.name}): {e}")
+
+        await interaction.followup.send(
+            f"✅ Admin broadcast sent to **{sent_count}** server(s).\n"
+            f"• Used fallback channel in: **{fallback_count}**\n"
+            f"• No accessible channel in: **{no_channel_count}**",
+            ephemeral=True
+        )
+
     # -------------------- Broadcast Commands --------------------
     @app_commands.command(name="qrf", description="Quick Reaction Force broadcast.")
     async def qrf(self, interaction: discord.Interaction, message: str):
@@ -387,6 +506,13 @@ class BroadcastsCog(commands.Cog):
     @app_commands.command(name="battle", description="Battle update broadcast.")
     async def battle(self, interaction: discord.Interaction, message: str):
         await self._broadcast_alert(interaction, "BATTLE", message)
+
+    @app_commands.command(
+        name="admin",
+        description="(Control server admins only) Broadcast an admin announcement to all servers."
+    )
+    async def admin(self, interaction: discord.Interaction, message: str):
+        await self._admin_broadcast(interaction, message)
 
     # -------------------- Local Test Broadcast (THIS server only) --------------------
     @app_commands.command(
@@ -443,7 +569,6 @@ class BroadcastsCog(commands.Cog):
             )
             return
 
-        # Permission report (before send)
         me = interaction.guild.me  # type: ignore
         perm_report = _perm_report_for_channel(me, channel)
 

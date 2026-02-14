@@ -31,7 +31,8 @@ async def setup_hook():
         "cogs.feedback",
         "cogs.admin",
         "cogs.groups",
-	"cogs.help",
+        "cogs.help",
+        "cogs.audit",
     ]
 
     loaded = []
@@ -61,6 +62,12 @@ async def setup_hook():
 async def on_ready():
     print("? Bot Online")
     print(f"?? FoxCom online as {bot.user}")
+
+    # Log every server the bot is installed on (verified or not)
+    guilds = sorted(bot.guilds, key=lambda g: (g.name or "").lower())
+    print(f"?? Installed on {len(guilds)} servers:")
+    for g in guilds:
+        print(f"  - {g.name} | {g.id}")
 
 
 if not TOKEN:
